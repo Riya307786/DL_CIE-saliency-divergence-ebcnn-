@@ -85,7 +85,7 @@ class BranchGradCAM:
             score = logits.gather(1, chosen_class.unsqueeze(1)).sum()
             
             self.model.zero_grad()
-            score.backward(retain_graph=True)
+            score.backward(retain_graph=(b_name != "B5"))
 
             acts = self.activations[b_name] # (B, C, H_f, W_f)
             grads = self.gradients[b_name]   # (B, C, H_f, W_f)

@@ -1,0 +1,15 @@
+{
+  "mcnemar_test": {
+    "test": "McNemar Test",
+    "contingency_table": {
+      "b_only_A_correct": 25,
+      "c_only_B_correct": 12
+    },
+    "statistic": 3.891891891891892,
+    "p_value": 0.0485197382802508,
+    "is_significant_05": true
+  },
+  "baseline_macro_f1": 0.68198111893683,
+  "proposed_macro_f1": 0.650862526921268,
+  "difference": -0.031118592015561997
+}

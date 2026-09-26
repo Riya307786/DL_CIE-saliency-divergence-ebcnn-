@@ -43,11 +43,15 @@ class EBCNNTrainer:
         self.model.train()
         total_loss = 0.0
         branch_losses = {f"loss_B{i}": 0.0 for i in range(1, 6)}
+        branch_correct = {f"B{i}": 0 for i in range(1, 6)}
+        total_samples = 0
         num_batches = 0
 
         for batch in train_loader:
             images = batch["image"].to(self.device)
             labels = batch["label"].to(self.device)
+            batch_sz = labels.size(0)
+            total_samples += batch_sz
 
             self.optimizer.zero_grad()
             logits_dict = self.model(images)
@@ -58,6 +62,8 @@ class EBCNNTrainer:
                 l_b = self.criterion(logits, labels)
                 batch_loss += l_b
                 branch_losses[f"loss_{b_name}"] += l_b.item()
+                preds = logits.argmax(dim=-1)
+                branch_correct[b_name] += (preds == labels).sum().item()
 
             batch_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
@@ -68,8 +74,10 @@ class EBCNNTrainer:
 
         avg_loss = total_loss / max(1, num_batches)
         res = {"train_total_loss": avg_loss}
-        for k, v in branch_losses.items():
-            res[k] = v / max(1, num_batches)
+        for i in range(1, 6):
+            b_name = f"B{i}"
+            res[f"loss_{b_name}"] = branch_losses[f"loss_{b_name}"] / max(1, num_batches)
+            res[f"acc_{b_name}"] = branch_correct[b_name] / max(1, total_samples)
         return res
 
     def evaluate(self, loader) -> Dict[str, Any]:
@@ -78,6 +86,8 @@ class EBCNNTrainer:
         all_logits = {f"B{i}": [] for i in range(1, 6)}
         all_targets = []
         all_ids = []
+        val_losses = {f"B{i}": 0.0 for i in range(1, 6)}
+        num_batches = 0
 
         with torch.no_grad():
             for batch in loader:
@@ -88,6 +98,9 @@ class EBCNNTrainer:
                 logits_dict = self.model(images)
                 for b in all_logits:
                     all_logits[b].append(logits_dict[b].cpu())
+                    l_b = self.criterion(logits_dict[b], labels).item()
+                    val_losses[b] += l_b
+
                 all_targets.append(labels.cpu())
                 if isinstance(ids, torch.Tensor):
                     all_ids.extend(ids.tolist())
@@ -95,6 +108,7 @@ class EBCNNTrainer:
                     all_ids.extend([int(x) for x in ids])
                 else:
                     all_ids.extend(list(ids))
+                num_batches += 1
 
         # Concatenate
         logits_tensor = {b: torch.cat(all_logits[b], dim=0) for b in all_logits}
@@ -109,18 +123,30 @@ class EBCNNTrainer:
             w_prec, w_rec, w_f1, _ = precision_recall_fscore_support(targets_np, preds, average="weighted", zero_division=0)
             
             # Per-class metrics
-            c_prec, c_rec, c_f1, _ = precision_recall_fscore_support(targets_np, preds, average=None, labels=list(range(9)), zero_division=0)
+            c_prec, c_rec, c_f1, c_supp = precision_recall_fscore_support(targets_np, preds, average=None, labels=list(range(9)), zero_division=0)
+            cm = confusion_matrix(targets_np, preds, labels=list(range(9))).tolist()
             
             branch_metrics[b] = {
+                "loss": float(val_losses[b] / max(1, num_batches)),
                 "accuracy": acc,
-                "macro_precision": float(prec),
-                "macro_recall": float(rec),
+                "precision": float(prec),
+                "recall": float(rec),
                 "macro_f1": float(f1),
                 "weighted_f1": float(w_f1),
-                "donut_f1": float(c_f1[1]),      # Class 1: Donut
-                "random_f1": float(c_f1[6]),     # Class 6: Random
-                "nearfull_f1": float(c_f1[5]),   # Class 5: Near-full
-                "per_class_f1": [float(x) for x in c_f1]
+                "donut_precision": float(c_prec[1]),
+                "donut_recall": float(c_rec[1]),
+                "donut_f1": float(c_f1[1]),          # Class 1: Donut
+                "random_precision": float(c_prec[6]),
+                "random_recall": float(c_rec[6]),
+                "random_f1": float(c_f1[6]),         # Class 6: Random
+                "nearfull_precision": float(c_prec[5]),
+                "nearfull_recall": float(c_rec[5]),
+                "nearfull_f1": float(c_f1[5]),       # Class 5: Near-full
+                "per_class_precision": [float(x) for x in c_prec],
+                "per_class_recall": [float(x) for x in c_rec],
+                "per_class_f1": [float(x) for x in c_f1],
+                "class_support": [int(x) for x in c_supp],
+                "confusion_matrix": cm
             }
 
         return {
@@ -136,15 +162,17 @@ class EBCNNTrainer:
         val_loader,
         epochs: int = 10,
         checkpoint_name: str = "ebcnn_model.pt",
-        early_stopping_patience: int = 4
+        early_stopping_patience: int = 4,
+        seed: int = 101
     ) -> Dict[str, Any]:
-        """Full training loop across epochs with checkpointing."""
+        """Full training loop across epochs with comprehensive checkpointing and metric logging."""
         history = []
         best_val_score = -1.0
         patience_counter = 0
         best_checkpoint_path = os.path.join(self.checkpoint_dir, checkpoint_name)
+        current_lr = self.optimizer.param_groups[0]["lr"]
 
-        print(f"Starting training on device: {self.device} for {epochs} epochs...")
+        print(f"Starting training on device: {self.device} for {epochs} epochs (Seed={seed}, LR={current_lr})...")
         start_time = time.time()
 
         for epoch in range(1, epochs + 1):
@@ -156,17 +184,39 @@ class EBCNNTrainer:
             # Use deepest branch B5 macro F1 for model selection
             val_score = val_metrics["B5"]["macro_f1"]
             self.scheduler.step(val_score)
+            current_lr = self.optimizer.param_groups[0]["lr"]
 
             ep_time = time.time() - ep_start
-            print(f"Epoch {epoch}/{epochs} [{ep_time:.1f}s]: TrainLoss={train_res['train_total_loss']:.4f} | "
+            print(f"Epoch {epoch}/{epochs} [{ep_time:.1f}s, LR={current_lr:.6f}]: "
+                  f"TrainLoss={train_res['train_total_loss']:.4f} | "
                   f"B5 ValAcc={val_metrics['B5']['accuracy']:.4f}, ValMacroF1={val_score:.4f}, "
                   f"DonutF1={val_metrics['B5']['donut_f1']:.4f}, RandomF1={val_metrics['B5']['random_f1']:.4f}")
 
+            # Structure per-branch metrics for this epoch
+            branch_epoch_summary = {}
+            for i in range(1, 6):
+                b_name = f"B{i}"
+                branch_epoch_summary[b_name] = {
+                    "train_loss": train_res.get(f"loss_{b_name}", 0.0),
+                    "train_accuracy": train_res.get(f"acc_{b_name}", 0.0),
+                    "val_loss": val_metrics[b_name]["loss"],
+                    "val_accuracy": val_metrics[b_name]["accuracy"],
+                    "val_precision": val_metrics[b_name]["precision"],
+                    "val_recall": val_metrics[b_name]["recall"],
+                    "val_macro_f1": val_metrics[b_name]["macro_f1"],
+                    "val_weighted_f1": val_metrics[b_name]["weighted_f1"],
+                    "donut_f1": val_metrics[b_name]["donut_f1"],
+                    "random_f1": val_metrics[b_name]["random_f1"],
+                    "nearfull_f1": val_metrics[b_name]["nearfull_f1"],
+                }
+
             history_entry = {
                 "epoch": epoch,
+                "learning_rate": current_lr,
+                "epoch_time": ep_time,
                 "train_metrics": train_res,
                 "val_metrics": val_metrics,
-                "epoch_time": ep_time
+                "branch_summary": branch_epoch_summary
             }
             history.append(history_entry)
 
@@ -175,9 +225,13 @@ class EBCNNTrainer:
                 patience_counter = 0
                 torch.save({
                     "epoch": epoch,
+                    "seed": seed,
+                    "learning_rate": current_lr,
                     "model_state_dict": self.model.state_dict(),
                     "val_metrics": val_metrics,
-                    "best_val_score": best_val_score
+                    "best_val_score": best_val_score,
+                    "branch_summary": branch_epoch_summary,
+                    "checkpoint_path": best_checkpoint_path
                 }, best_checkpoint_path)
                 print(f"  --> Saved new best checkpoint to {best_checkpoint_path} (B5 Macro F1: {best_val_score:.4f})")
             else:
@@ -193,6 +247,25 @@ class EBCNNTrainer:
         if os.path.exists(best_checkpoint_path):
             ckpt = torch.load(best_checkpoint_path, map_location=self.device)
             self.model.load_state_dict(ckpt["model_state_dict"])
+
+        # Persist branch training metrics json for UI and API consumption
+        results_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "results")
+        os.makedirs(results_dir, exist_ok=True)
+        branch_metrics_file = os.path.join(results_dir, "branch_training_metrics.json")
+        try:
+            with open(branch_metrics_file, "w") as f:
+                json.dump({
+                    "seed": seed,
+                    "epochs_trained": len(history),
+                    "best_val_macro_f1": best_val_score,
+                    "total_training_duration": total_time,
+                    "checkpoint_path": best_checkpoint_path,
+                    "history": history,
+                    "final_branch_metrics": val_metrics
+                }, f, indent=2)
+            print(f"Persisted branch training metrics to {branch_metrics_file}")
+        except Exception as e:
+            print(f"Warning: could not write branch training metrics: {e}")
 
         return {
             "history": history,
