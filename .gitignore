@@ -1,0 +1,45 @@
+# Dataset and large data files
+dataset/raw/
+dataset/extracted/
+*.pkl
+*.zip
+
+# Model checkpoints and generated models
+checkpoints/
+checkpoints_test/
+artifacts/models/
+*.pt
+*.pth
+*.ckpt
+
+# Generated artifacts
+artifacts/
+
+# Logs and debug output
+*.log
+fit_error.txt
+hpo_debug.txt
+runner_debug.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
